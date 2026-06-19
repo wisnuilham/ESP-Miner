@@ -5,6 +5,7 @@
 #include "global_state.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_random.h" // Ditambahkan untuk fungsi esp_random()
 #include "mining.h"
 #include "string.h"
 #include "esp_timer.h"
@@ -57,6 +58,7 @@ void create_jobs_task(void *pvParameters)
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     uint64_t extranonce_2 = 0;
+    uint64_t en2_mask = 0xFFFFFFFFFFFFFFFFULL; // Mask untuk menjaga extranonce_2 max 64-bit
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -129,7 +131,27 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            extranonce_2 = 0;
+            // --- REVISI: Randomisasi extranonce_2 max 64 bit (8 byte) tiap job baru ---
+            uint8_t en2_len = 0;
+            if (current_work_protocol == STRATUM_PROTOCOL_V2) {
+                if (stratum_v2_is_extended_channel(GLOBAL_STATE) && GLOBAL_STATE->sv2_conn) {
+                    en2_len = GLOBAL_STATE->sv2_conn->extranonce_size;
+                }
+            } else {
+                en2_len = GLOBAL_STATE->extranonce_2_len;
+            }
+
+            // Batasi agar ukuran extranonce maksimal hanya 8 byte (64 bit)
+            if (en2_len > 8) {
+                en2_len = 8;
+            }
+
+            // Set mask sesuai byte length yang diizinkan (menghindari shift >= 64bit Undefined Behavior)
+            en2_mask = (en2_len >= 8) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << (en2_len * 8)) - 1);
+
+            // Set extranonce_2 menggunakan kombinasi true random (karena esp_random itu 32-bit, kita shift ke 64-bit)
+            extranonce_2 = (((uint64_t)esp_random() << 32) | esp_random()) & en2_mask;
+            // -------------------------------------------------------------------------
 
             // Check clean_jobs flag
             bool clean;
@@ -176,13 +198,13 @@ void create_jobs_task(void *pvParameters)
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                 generate_work_sv2_ext(GLOBAL_STATE, (sv2_ext_job_t *)current_work, difficulty, extranonce_2);
-                extranonce_2++;
+                extranonce_2 = (extranonce_2 + 1) & en2_mask; // Terapkan mask setelah di-increment
             } else {
                 generate_work_sv2(GLOBAL_STATE, (sv2_job_t *)current_work, difficulty);
             }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            extranonce_2++;
+            extranonce_2 = (extranonce_2 + 1) & en2_mask; // Terapkan mask setelah di-increment
         }
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
